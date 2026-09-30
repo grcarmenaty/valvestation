@@ -1,1 +1,5 @@
-projects_dir = ""
+# Pre-shared token clients send as "Authorization: Bearer <token>"
+token = ""
+
+# Seconds Canonada may take to load a project
+canonada_timeout = 60
