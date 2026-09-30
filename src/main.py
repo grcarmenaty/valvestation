@@ -423,6 +423,123 @@ sys.stdout.write("\\n")
         raise HTTPException(404, f"System '{system}' not found")
     return view
 
+# Catalog ----------------------------------------------------------------------
+def _inject_toml(project: str, file: UploadFile, filename: str) -> dict:
+    """
+    Replace one of a project's config TOML files with an uploaded file
+    """
+
+    # Hidden entries are uploads and removals in progress
+    listed = {p.name for p in PROJECTS_DIR.iterdir() if p.is_dir() and not p.name.startswith(".")}
+    if project not in listed:
+        raise HTTPException(404, f"Project '{project}' not found")
+
+    staging = Path(tempfile.mkdtemp(prefix=".staging-", dir=PROJECTS_DIR))
+    try:
+        uploaded = staging / filename
+        with uploaded.open("wb") as f:
+            shutil.copyfileobj(file.file, f)
+        try:
+            with uploaded.open("rb") as f:
+                tomllib.load(f)
+        except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as e:
+            raise HTTPException(400, f"Could not read the TOML file: {e}")
+
+        target = PROJECTS_DIR / project / "config" / filename
+        with projects_lock:
+            listed = {p.name for p in PROJECTS_DIR.iterdir() if p.is_dir() and not p.name.startswith(".")}
+            if project not in listed:
+                raise HTTPException(404, f"Project '{project}' not found")
+            target.parent.mkdir(exist_ok=True)
+            replaced = target.is_file()
+            shutil.move(uploaded, target)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+
+    return {"project": project, "replaced": replaced}
+
+
+@app.get("/catalog/projects/{project}/catalog")
+def get_catalog(project: str):
+    """
+    List the datasets in a project's catalog
+    """
+
+    script = """\
+import json
+import sys
+
+from canonada.catalog import ls
+
+try:
+    entries = ls()
+except FileNotFoundError:
+    entries = None
+sys.stdout.write("\\n")
+json.dump(entries, sys.stdout)
+sys.stdout.write("\\n")
+"""
+
+    catalog = _exec_return_json(project, script)
+    if catalog is None:
+        raise HTTPException(404, f"Project '{project}' has no config/catalog.toml")
+    return catalog
+
+
+@app.get("/catalog/projects/{project}/parameters")
+def get_parameters(project: str):
+    """
+    A project's parameters, with nested tables flattened the way Canonada reads them
+    """
+
+    script = """\
+import json
+import sys
+
+from canonada.catalog import params
+
+try:
+    entries = params()
+except FileNotFoundError:
+    entries = None
+sys.stdout.write("\\n")
+json.dump(entries, sys.stdout, default=str)
+sys.stdout.write("\\n")
+"""
+
+    parameters = _exec_return_json(project, script)
+    if parameters is None:
+        raise HTTPException(404, f"Project '{project}' has no config/parameters.toml")
+    return parameters
+
+
+@app.put("/catalog/projects/{project}/catalog")
+def inject_catalog(project: str, file: UploadFile):
+    """
+    Replace a project's catalog.toml
+    """
+
+    return _inject_toml(project, file, "catalog.toml")
+
+
+@app.put("/catalog/projects/{project}/parameters")
+def inject_parameters(project: str, file: UploadFile):
+    """
+    Replace a project's parameters.toml
+    """
+
+    return _inject_toml(project, file, "parameters.toml")
+
+
+@app.put("/catalog/projects/{project}/credentials")
+def inject_credentials(project: str, file: UploadFile):
+    """
+    Replace a project's credentials.toml
+    """
+
+    return _inject_toml(project, file, "credentials.toml")
+
+
 # MAIN -------------------------------------------------------------------------
 
 if __name__ == "__main__":
