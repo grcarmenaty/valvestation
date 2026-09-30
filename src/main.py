@@ -209,7 +209,7 @@ def remove_project(project: str):
 
 
 # Registry ---------------------------------------------------------------------
-def _exec_return_json(project: str, script: str) -> list:
+def _exec_return_json(project: str, script: str) -> list | dict | None:
     """
     Run a script inside a project and return the JSON it prints
     """
@@ -239,10 +239,10 @@ def _exec_return_json(project: str, script: str) -> list:
         raise HTTPException(500, f"Canonada can't load project '{project}'{reason}")
 
     try:
-        # Importing the project may print; the registry is the last line
+        # Importing the project may print; the JSON is the last line
         return json.loads(result.stdout.rsplit("\n", 2)[-2])
     except (json.JSONDecodeError, IndexError):
-        raise HTTPException(500, f"Canonada returned no registry for project '{project}'")
+        raise HTTPException(500, f"Canonada returned no JSON for project '{project}'")
 
 
 @app.get("/registry/projects")
@@ -323,6 +323,105 @@ sys.stdout.write("\\n")
 
     return _exec_return_json(project, script)
 
+
+# View -------------------------------------------------------------------------
+@app.get("/view/projects/{project}/pipelines/{pipeline}")
+def view_pipeline(project: str, pipeline: str):
+    """
+    Returns a pipeline's nodes and their inputs and outputs
+    """
+
+    # Canonada is imported before the project is on the path, so the project can't shadow it.
+    script = """\
+import json
+import os
+import sys
+
+from canonada.pipeline import Pipeline
+
+sys.path.append(os.getcwd())
+from pipelines import *
+from systems import *
+
+match = next((p for p in Pipeline.registry if p.name == %%PIPELINE%%), None)
+if match is None:
+    entry = None
+else:
+    entry = {
+        "name": match.name,
+        "description": match.description,
+        "nodes": [
+            {
+                "name": node.name,
+                "description": node.description,
+                "input": node.input,
+                "output": node.output,
+            }
+            for node in match.nodes
+        ],
+    }
+sys.stdout.write("\\n")
+json.dump(entry, sys.stdout)
+sys.stdout.write("\\n")
+""".replace("%%PIPELINE%%", json.dumps(pipeline))
+
+    view = _exec_return_json(project, script)
+    if view is None:
+        raise HTTPException(404, f"Pipeline '{pipeline}' not found")
+    return view
+
+
+@app.get("/view/projects/{project}/systems/{system}")
+def view_system(project: str, system: str):
+    """
+    Returns a system's pipelines in run order, each with its nodes and their inputs and outputs
+    """
+
+    # Canonada is imported before the project is on the path, so the project can't shadow it.
+    script = """\
+import json
+import os
+import sys
+
+from canonada.system import System
+
+sys.path.append(os.getcwd())
+from pipelines import *
+from systems import *
+
+match = next((s for s in System.registry if s.name == %%SYSTEM%%), None)
+if match is None:
+    entry = None
+else:
+    entry = {
+        "name": match.name,
+        "description": match.description,
+        "pipelines": [
+            {
+                "name": pipe.name,
+                "description": pipe.description,
+                "nodes": [
+                    {
+                        "name": node.name,
+                        "description": node.description,
+                        "input": node.input,
+                        "output": node.output,
+                    }
+                    for node in pipe.nodes
+                ],
+            }
+            for pipe in match.pipeline
+        ],
+    }
+sys.stdout.write("\\n")
+json.dump(entry, sys.stdout)
+sys.stdout.write("\\n")
+""".replace("%%SYSTEM%%", json.dumps(system))
+
+    view = _exec_return_json(project, script)
+    if view is None:
+        raise HTTPException(404, f"System '{system}' not found")
+    return view
 
 # MAIN -------------------------------------------------------------------------
 
