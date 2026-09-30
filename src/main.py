@@ -6,6 +6,7 @@ Configuration is read from config.toml in the working directory. Run with:
 """
 
 import hmac
+import json
 import logging
 import shutil
 import subprocess
@@ -205,6 +206,122 @@ def remove_project(project: str):
         raise HTTPException(404, f"Project '{project}' not found")
 
     return {"project": project, "removed": True}
+
+
+# Registry ---------------------------------------------------------------------
+def _exec_return_json(project: str, script: str) -> list:
+    """
+    Run a script inside a project and return the JSON it prints
+    """
+
+    # Hidden entries are uploads and removals in progress
+    listed = {p.name for p in PROJECTS_DIR.iterdir() if p.is_dir() and not p.name.startswith(".")}
+    if project not in listed:
+        raise HTTPException(404, f"Project '{project}' not found")
+
+    try:
+        result = subprocess.run(
+            [sys.executable, "-P", "-c", script],
+            cwd=PROJECTS_DIR / project,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=config["canonada_timeout"],
+        )
+    except subprocess.TimeoutExpired:
+        raise HTTPException(504, f"Canonada timed out loading project '{project}'")
+    except FileNotFoundError:  # Removed by another request meanwhile
+        raise HTTPException(404, f"Project '{project}' not found")
+
+    if result.returncode != 0:
+        detail = result.stderr.strip().splitlines()
+        reason = f": {detail[-1]}" if detail else ""
+        raise HTTPException(500, f"Canonada can't load project '{project}'{reason}")
+
+    try:
+        # Importing the project may print; the registry is the last line
+        return json.loads(result.stdout.rsplit("\n", 2)[-2])
+    except (json.JSONDecodeError, IndexError):
+        raise HTTPException(500, f"Canonada returned no registry for project '{project}'")
+
+
+@app.get("/registry/projects")
+def get_projects():
+    """
+    List available projects
+    """
+    return {"projects": [p.name for p in PROJECTS_DIR.iterdir() if p.is_dir() and not p.name.startswith(".")]}
+
+
+@app.get("/registry/projects/{project}/pipelines")
+def get_pipelines(project: str):
+    """
+    List a project's pipelines with their description, node names and execution settings
+    """
+
+    # Canonada is imported before the project is on the path, so the project can't shadow it.
+    script = """\
+import json
+import os
+import sys
+
+from canonada.pipeline import Pipeline
+
+sys.path.append(os.getcwd())
+from pipelines import *
+from systems import *
+
+entries = [
+    {
+        "name": p.name,
+        "description": p.description,
+        "nodes": [node.name for node in p.nodes],
+        "max_workers": p.max_workers,
+        "multiprocessing": p.multiprocessing,
+        "error_tolerant": p.error_tolerant,
+    }
+    for p in Pipeline.registry
+]
+sys.stdout.write("\\n")
+json.dump(entries, sys.stdout)
+sys.stdout.write("\\n")
+"""
+
+    return _exec_return_json(project, script)
+
+
+@app.get("/registry/projects/{project}/systems")
+def get_systems(project: str):
+    """
+    List a project's systems with their description and the pipelines they run, in order
+    """
+
+    # Canonada is imported before the project is on the path, so the project can't shadow it.
+    script = """\
+import json
+import os
+import sys
+
+from canonada.system import System
+
+sys.path.append(os.getcwd())
+from pipelines import *
+from systems import *
+
+entries = [
+    {
+        "name": s.name,
+        "description": s.description,
+        "pipelines": [p.name for p in s.pipeline],
+    }
+    for s in System.registry
+]
+sys.stdout.write("\\n")
+json.dump(entries, sys.stdout)
+sys.stdout.write("\\n")
+"""
+
+    return _exec_return_json(project, script)
 
 
 # MAIN -------------------------------------------------------------------------
