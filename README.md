@@ -1,4 +1,41 @@
-# Valve Station
+# ValveStation
+
+## Install
+
+From a checkout:
+
+```bash
+pip install .
+```
+
+In the directory that will hold the station, copy the packaged config and create `projects/`:
+
+```bash
+valvestation install
+```
+
+Set `token` in `config.toml`. `canonada_timeout` is how many seconds Canonada may take to load a project. An existing `config.toml` is left unchanged.
+
+Start the server in that same directory:
+
+```bash
+valvestation
+```
+
+It listens on `127.0.0.1:508`. `VALVESTATION_HOST` and `VALVESTATION_PORT` override the address.
+
+## Docker
+
+Build the image, then install a station into a mounted directory and run it:
+
+```bash
+docker build -t valvestation .
+docker run --rm -v "$PWD:/station" valvestation install
+docker run --rm -p 508:508 -v "$PWD:/station" valvestation
+```
+
+The image sets `VALVESTATION_HOST=0.0.0.0`. Set `token` in the mounted `config.toml` before the second command. `projects/` in that directory is where uploaded Canonada projects are stored, and `projects/.logs` holds run logs.
+
 ## API Endpoints
 
 To get an API response the client will need to send a pre-shared token, that will be user set using a configuration file. The valve station config will accept the token as a connection string.

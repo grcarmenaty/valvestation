@@ -1,5 +1,5 @@
 # Pre-shared token clients send as "Authorization: Bearer <token>"
 token = ""
 
-# Seconds Canonada may take to load a project
+# Seconds Canonada may take to load a project before timing out
 canonada_timeout = 60

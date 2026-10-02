@@ -1,8 +1,10 @@
 """
-ValveStation: an HTTP API to control the Canonada projects
+ValveStation: an HTTP service to control the Canonada projects
 
-Configuration is read from config.toml in the working directory. Run with:
-    python src/main.py
+Configuration is read from config.toml in the working directory. Install a station with:
+    valvestation install
+Run with:
+    valvestation
 """
 
 import hmac
@@ -18,10 +20,12 @@ import threading
 import tomllib
 import zipfile
 import zlib
+from collections.abc import Awaitable, Callable
 from pathlib import Path
+from typing import IO, cast
 
 import uvicorn
-from fastapi import FastAPI, HTTPException, Request, UploadFile
+from fastapi import FastAPI, HTTPException, Request, Response, UploadFile
 from fastapi.responses import JSONResponse, PlainTextResponse
 
 CONFIG_PATH = Path("config.toml").resolve()
@@ -33,8 +37,29 @@ log = logging.getLogger("valvestation")
 projects_lock = threading.Lock()  # Serialises adding and removing projects
 runs_lock = threading.Lock()  # Serialises the run list
 runs: list[dict] = []  # Pipeline and system runs for this server process
+config: dict  # Filled by main() before the server accepts requests
 
 app = FastAPI()
+
+
+def install() -> None:
+    """
+    Copy the packaged template config.toml into the working directory and create projects/.
+    An existing config.toml is left unchanged.
+    """
+
+    dest = Path("config.toml").resolve()
+    if dest.is_file():
+        log.info(f"Config already present at {dest}")
+    else:
+        template = Path(__file__).resolve().parent / "templates" / "config.toml"
+        if not template.is_file():
+            log.error(f"No config template found at {template}")
+            sys.exit(1)
+        shutil.copyfile(template, dest)
+        log.info(f"Wrote config to {dest}. Set 'token' in it before starting")
+
+    (dest.parent / "projects").mkdir(exist_ok=True)
 
 
 def check_install() -> None:
@@ -86,7 +111,7 @@ def load_config() -> dict:
     return config
 
 @app.middleware("http")
-async def check_token(request: Request, call_next):
+async def check_token(request: Request, call_next: Callable[[Request], Awaitable[Response]]) -> Response:
     """
     Every request needs the pre-shared token. It's checked before the body is read, so
     unauthenticated uploads are never stored.
@@ -158,7 +183,7 @@ def _project_name(project: Path) -> str:
 
 # Project ----------------------------------------------------------------------
 @app.put("/project/add")
-def add_project(file: UploadFile):
+def add_project(file: UploadFile) -> dict:
     """
     Receive a Canonada project as a zip or tar archive. Its name is read from canonada.toml, and a
     project with the same name is overwritten.
@@ -193,7 +218,7 @@ def add_project(file: UploadFile):
 
 
 @app.delete("/project/remove/{project}")
-def remove_project(project: str):
+def remove_project(project: str) -> dict:
     """
     Remove a Canonada project from the station
     """
@@ -249,8 +274,38 @@ def _exec_return_json(project: str, script: str) -> list | dict | None:
         raise HTTPException(500, f"Canonada returned no JSON for project '{project}'")
 
 
+def _expect_dict(value: list | dict | None, project: str) -> dict:
+    """
+    The JSON object printed by a project script
+    """
+
+    if isinstance(value, dict):
+        return value
+    raise HTTPException(500, f"Canonada returned no JSON for project '{project}'")
+
+
+def _expect_dicts(value: list | dict | None, project: str) -> list[dict]:
+    """
+    The JSON list of objects printed by a project script
+    """
+
+    if isinstance(value, list) and all(isinstance(item, dict) for item in value):
+        return cast(list[dict], value)
+    raise HTTPException(500, f"Canonada returned no JSON for project '{project}'")
+
+
+def _expect_strs(value: list | dict | None, project: str) -> list[str]:
+    """
+    The JSON list of strings printed by a project script
+    """
+
+    if isinstance(value, list) and all(isinstance(item, str) for item in value):
+        return cast(list[str], value)
+    raise HTTPException(500, f"Canonada returned no JSON for project '{project}'")
+
+
 @app.get("/registry/projects")
-def get_projects():
+def get_projects() -> dict:
     """
     List available projects
     """
@@ -258,7 +313,7 @@ def get_projects():
 
 
 @app.get("/registry/projects/{project}/pipelines")
-def get_pipelines(project: str):
+def get_pipelines(project: str) -> list[dict]:
     """
     List a project's pipelines with their description, node names and execution settings
     """
@@ -291,11 +346,11 @@ json.dump(entries, sys.stdout)
 sys.stdout.write("\\n")
 """
 
-    return _exec_return_json(project, script)
+    return _expect_dicts(_exec_return_json(project, script), project)
 
 
 @app.get("/registry/projects/{project}/systems")
-def get_systems(project: str):
+def get_systems(project: str) -> list[dict]:
     """
     List a project's systems with their description and the pipelines they run, in order
     """
@@ -325,12 +380,12 @@ json.dump(entries, sys.stdout)
 sys.stdout.write("\\n")
 """
 
-    return _exec_return_json(project, script)
+    return _expect_dicts(_exec_return_json(project, script), project)
 
 
 # View -------------------------------------------------------------------------
 @app.get("/view/projects/{project}/pipelines/{pipeline}")
-def view_pipeline(project: str, pipeline: str):
+def view_pipeline(project: str, pipeline: str) -> dict:
     """
     Returns a pipeline's nodes and their inputs and outputs
     """
@@ -372,11 +427,11 @@ sys.stdout.write("\\n")
     view = _exec_return_json(project, script)
     if view is None:
         raise HTTPException(404, f"Pipeline '{pipeline}' not found")
-    return view
+    return _expect_dict(view, project)
 
 
 @app.get("/view/projects/{project}/systems/{system}")
-def view_system(project: str, system: str):
+def view_system(project: str, system: str) -> dict:
     """
     Returns a system's pipelines in run order, each with its nodes and their inputs and outputs
     """
@@ -425,7 +480,7 @@ sys.stdout.write("\\n")
     view = _exec_return_json(project, script)
     if view is None:
         raise HTTPException(404, f"System '{system}' not found")
-    return view
+    return _expect_dict(view, project)
 
 # Catalog ----------------------------------------------------------------------
 def _inject_toml(project: str, file: UploadFile, filename: str) -> dict:
@@ -464,7 +519,7 @@ def _inject_toml(project: str, file: UploadFile, filename: str) -> dict:
 
 
 @app.get("/catalog/projects/{project}/catalog")
-def get_catalog(project: str):
+def get_catalog(project: str) -> list[str]:
     """
     List the datasets in a project's catalog
     """
@@ -487,11 +542,11 @@ sys.stdout.write("\\n")
     catalog = _exec_return_json(project, script)
     if catalog is None:
         raise HTTPException(404, f"Project '{project}' has no config/catalog.toml")
-    return catalog
+    return _expect_strs(catalog, project)
 
 
 @app.get("/catalog/projects/{project}/parameters")
-def get_parameters(project: str):
+def get_parameters(project: str) -> dict:
     """
     A project's parameters, with nested tables flattened the way Canonada reads them
     """
@@ -514,11 +569,11 @@ sys.stdout.write("\\n")
     parameters = _exec_return_json(project, script)
     if parameters is None:
         raise HTTPException(404, f"Project '{project}' has no config/parameters.toml")
-    return parameters
+    return _expect_dict(parameters, project)
 
 
 @app.put("/catalog/projects/{project}/catalog")
-def inject_catalog(project: str, file: UploadFile):
+def inject_catalog(project: str, file: UploadFile) -> dict:
     """
     Replace a project's catalog.toml
     """
@@ -527,7 +582,7 @@ def inject_catalog(project: str, file: UploadFile):
 
 
 @app.put("/catalog/projects/{project}/parameters")
-def inject_parameters(project: str, file: UploadFile):
+def inject_parameters(project: str, file: UploadFile) -> dict:
     """
     Replace a project's parameters.toml
     """
@@ -536,7 +591,7 @@ def inject_parameters(project: str, file: UploadFile):
 
 
 @app.put("/catalog/projects/{project}/credentials")
-def inject_credentials(project: str, file: UploadFile):
+def inject_credentials(project: str, file: UploadFile) -> dict:
     """
     Replace a project's credentials.toml
     """
@@ -597,7 +652,7 @@ def init_runs() -> None:
         runs.extend(loaded)
 
 
-def _watch_run(record: dict, proc: subprocess.Popen, log_file) -> None:
+def _watch_run(record: dict, proc: subprocess.Popen[bytes], log_file: IO[str]) -> None:
     """
     Wait for a run to exit and record whether it finished or errored
     """
@@ -650,7 +705,7 @@ def _start_run(kind: str, project: str, name: str) -> dict:
 
 
 @app.post("/run/projects/{project}/pipelines/{pipeline}")
-def run_pipeline(project: str, pipeline: str):
+def run_pipeline(project: str, pipeline: str) -> dict:
     """
     Run a pipeline. Its output is written to projects/.logs and the run is tracked until it exits.
     """
@@ -662,7 +717,7 @@ def run_pipeline(project: str, pipeline: str):
 
 
 @app.post("/run/projects/{project}/systems/{system}")
-def run_system(project: str, system: str):
+def run_system(project: str, system: str) -> dict:
     """
     Run a system. Its output is written to projects/.logs and the run is tracked until it exits.
     """
@@ -697,7 +752,7 @@ def _log_response(record: dict) -> PlainTextResponse:
 
 
 @app.get("/logs/pipelines")
-def list_pipeline_runs():
+def list_pipeline_runs() -> list[dict]:
     """
     Pipeline runs and whether each is running, finished, or errored
     """
@@ -707,7 +762,7 @@ def list_pipeline_runs():
 
 
 @app.get("/logs/systems")
-def list_system_runs():
+def list_system_runs() -> list[dict]:
     """
     System runs and whether each is running, finished, or errored
     """
@@ -717,7 +772,7 @@ def list_system_runs():
 
 
 @app.get("/logs/projects/{project}/pipelines/{pipeline}")
-def read_pipeline_log(project: str, pipeline: str):
+def read_pipeline_log(project: str, pipeline: str) -> PlainTextResponse:
     """
     The log of the latest run of a pipeline
     """
@@ -729,7 +784,7 @@ def read_pipeline_log(project: str, pipeline: str):
 
 
 @app.get("/logs/projects/{project}/pipelines/{pipeline}/{run}")
-def read_pipeline_run_log(project: str, pipeline: str, run: int):
+def read_pipeline_run_log(project: str, pipeline: str, run: int) -> PlainTextResponse:
     """
     The log of one pipeline run
     """
@@ -741,7 +796,7 @@ def read_pipeline_run_log(project: str, pipeline: str, run: int):
 
 
 @app.get("/logs/projects/{project}/systems/{system}")
-def read_system_log(project: str, system: str):
+def read_system_log(project: str, system: str) -> PlainTextResponse:
     """
     The log of the latest run of a system
     """
@@ -753,7 +808,7 @@ def read_system_log(project: str, system: str):
 
 
 @app.get("/logs/projects/{project}/systems/{system}/{run}")
-def read_system_run_log(project: str, system: str, run: int):
+def read_system_run_log(project: str, system: str, run: int) -> PlainTextResponse:
     """
     The log of one system run
     """
@@ -765,15 +820,15 @@ def read_system_run_log(project: str, system: str, run: int):
 
 # Misc -------------------------------------------------------------------------
 @app.get("/version")
-def get_version():
+def get_version() -> dict:
     """
     The version of the server
     """
-    from _version import __version__
+    from valvestation._version import __version__
     return {"version": __version__}
 
 @app.get("/health")
-def get_health():
+def get_health() -> dict:
     """
     The health of the server
     """
@@ -782,9 +837,22 @@ def get_health():
 
 # MAIN -------------------------------------------------------------------------
 
-if __name__ == "__main__":
-    logging.basicConfig(format="%(asctime)s - %(name)s: [%(levelname)s]: %(message)s")
+def main() -> None:
+    """
+    Install a station directory, or start the server in the working directory
+    """
+
+    installing = len(sys.argv) > 1 and sys.argv[1] == "install"
+    logging.basicConfig(
+        format="%(asctime)s - %(name)s: [%(levelname)s]: %(message)s",
+        level=logging.INFO if installing else logging.WARNING,
+    )
+    if installing:
+        install()
+        return
+
     check_install()  # First thing at boot
+    global config
     config = load_config()
 
     # Leftovers of uploads and removals interrupted by a restart
@@ -794,4 +862,10 @@ if __name__ == "__main__":
     # Build the run list from projects/.logs. It then lives until this process exits.
     init_runs()
 
-    uvicorn.run(app)
+    host = os.environ.get("VALVESTATION_HOST", "127.0.0.1")
+    port = int(os.environ.get("VALVESTATION_PORT", "508"))
+    uvicorn.run(app, host=host, port=port)
+
+
+if __name__ == "__main__":
+    main()
