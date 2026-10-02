@@ -36,4 +36,3 @@ To get an API response the client will need to send a pre-shared token, that wil
 ### Misc
 - GET /version
 - GET /health
-- GET /logs -> Flow valve internal logs

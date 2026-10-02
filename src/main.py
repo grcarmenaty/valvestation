@@ -763,6 +763,22 @@ def read_system_run_log(project: str, system: str, run: int):
         raise HTTPException(404, f"Run {run} of system '{system}' in project '{project}' not found")
     return _log_response(matched[0])
 
+# Misc -------------------------------------------------------------------------
+@app.get("/version")
+def get_version():
+    """
+    The version of the server
+    """
+    from _version import __version__
+    return {"version": __version__}
+
+@app.get("/health")
+def get_health():
+    """
+    The health of the server
+    """
+    with runs_lock:
+        return {"health": "idle" if all(r["status"] != "running" for r in runs) else "running"}
 
 # MAIN -------------------------------------------------------------------------
 
