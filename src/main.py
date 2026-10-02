@@ -8,6 +8,7 @@ Configuration is read from config.toml in the working directory. Run with:
 import hmac
 import json
 import logging
+import os
 import shutil
 import subprocess
 import sys
@@ -21,14 +22,17 @@ from pathlib import Path
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request, UploadFile
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 
 CONFIG_PATH = Path("config.toml").resolve()
 PROJECTS_DIR = CONFIG_PATH.parent / "projects"  # One sub-directory per Canonada project
+LOGS_DIR = PROJECTS_DIR / ".logs"  # Hidden so it is not listed as a project
 
 log = logging.getLogger("valvestation")
 
 projects_lock = threading.Lock()  # Serialises adding and removing projects
+runs_lock = threading.Lock()  # Serialises the run list
+runs: list[dict] = []  # Pipeline and system runs for this server process
 
 app = FastAPI()
 
@@ -539,6 +543,226 @@ def inject_credentials(project: str, file: UploadFile):
 
     return _inject_toml(project, file, "credentials.toml")
 
+# Run --------------------------------------------------------------------------
+def _public_run(record: dict) -> dict:
+    """
+    The fields a client sees for one run
+    """
+
+    key = "pipeline" if record["kind"] == "pipelines" else "system"
+    return {"project": record["project"], key: record[key], "run": record["run"], "status": record["status"]}
+
+
+def _run_dir(kind: str, project: str, name: str, run: int) -> Path:
+    """
+    Directory of one run's log and status. Refuses a name that would leave .logs.
+    """
+
+    path = (LOGS_DIR / project / kind / name / str(run)).resolve()
+    if not path.is_relative_to(LOGS_DIR.resolve()):
+        raise HTTPException(404, f"'{name}' not found")
+    return path
+
+
+def init_runs() -> None:
+    """
+    Create .logs and load runs recorded there. A run still marked running belonged to a
+    previous process, which is gone, so it is recorded as errored.
+    """
+
+    LOGS_DIR.mkdir(exist_ok=True)
+    loaded = []
+    for status_path in LOGS_DIR.glob("*/*/*/*/status"):
+        project, kind, name, run_s, _ = status_path.relative_to(LOGS_DIR).parts
+        if kind not in ("pipelines", "systems"):
+            continue
+        try:
+            run = int(run_s)
+        except ValueError:
+            continue
+        status = status_path.read_text(encoding="utf-8").strip()
+        if status == "running":
+            status = "errored"
+            status_path.write_text("errored\n", encoding="utf-8")
+            with (status_path.parent / "log").open("a", encoding="utf-8") as f:
+                f.write("ValveStation restarted while this run was still going\n")
+        elif status not in ("finished", "errored"):
+            status = "errored"
+            status_path.write_text("errored\n", encoding="utf-8")
+        key = "pipeline" if kind == "pipelines" else "system"
+        loaded.append({"kind": kind, "project": project, key: name, "run": run, "status": status})
+    loaded.sort(key=lambda record: (record["project"], record["kind"], record["run"]))
+    with runs_lock:
+        runs.clear()
+        runs.extend(loaded)
+
+
+def _watch_run(record: dict, proc: subprocess.Popen, log_file) -> None:
+    """
+    Wait for a run to exit and record whether it finished or errored
+    """
+
+    try:
+        status = "finished" if proc.wait() == 0 else "errored"
+    except Exception:
+        status = "errored"
+    finally:
+        log_file.close()
+    with runs_lock:
+        record["status"] = status
+    key = "pipeline" if record["kind"] == "pipelines" else "system"
+    status_path = _run_dir(record["kind"], record["project"], record[key], record["run"]) / "status"
+    status_path.write_text(status + "\n", encoding="utf-8")
+
+
+def _start_run(kind: str, project: str, name: str) -> dict:
+    """
+    Start a Canonada pipeline or system. stdout and stderr share one log file, and each
+    start gets the next run number for that name.
+    """
+
+    key = "pipeline" if kind == "pipelines" else "system"
+    with runs_lock:
+        taken = [r["run"] for r in runs if r["kind"] == kind and r["project"] == project and r[key] == name]
+        run = max(taken, default=0) + 1
+        run_dir = _run_dir(kind, project, name, run)
+        run_dir.mkdir(parents=True)
+        (run_dir / "status").write_text("running\n", encoding="utf-8")
+        log_file = (run_dir / "log").open("w", encoding="utf-8")
+        record = {"kind": kind, "project": project, key: name, "run": run, "status": "running"}
+        runs.append(record)
+        try:
+            proc = subprocess.Popen(
+                [sys.executable, "-P", "-m", "canonada.cli", "run", kind, name],
+                cwd=PROJECTS_DIR / project,
+                stdin=subprocess.DEVNULL,
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                env={**os.environ, "PYTHONUNBUFFERED": "1"},
+            )
+        except OSError as e:
+            log_file.close()
+            record["status"] = "errored"
+            (run_dir / "status").write_text("errored\n", encoding="utf-8")
+            raise HTTPException(500, f"Could not start Canonada: {e}")
+    threading.Thread(target=_watch_run, args=(record, proc, log_file), daemon=True).start()
+    return _public_run(record)
+
+
+@app.post("/run/projects/{project}/pipelines/{pipeline}")
+def run_pipeline(project: str, pipeline: str):
+    """
+    Run a pipeline. Its output is written to projects/.logs and the run is tracked until it exits.
+    """
+
+    names = [entry["name"] for entry in get_pipelines(project)]
+    if pipeline not in names:
+        raise HTTPException(404, f"Pipeline '{pipeline}' not found")
+    return _start_run("pipelines", project, pipeline)
+
+
+@app.post("/run/projects/{project}/systems/{system}")
+def run_system(project: str, system: str):
+    """
+    Run a system. Its output is written to projects/.logs and the run is tracked until it exits.
+    """
+
+    names = [entry["name"] for entry in get_systems(project)]
+    if system not in names:
+        raise HTTPException(404, f"System '{system}' not found")
+    return _start_run("systems", project, system)
+
+
+# Logs -------------------------------------------------------------------------
+def _matching_runs(kind: str, project: str, name: str) -> list[dict]:
+    """
+    Runs of one pipeline or system, in run order
+    """
+
+    key = "pipeline" if kind == "pipelines" else "system"
+    with runs_lock:
+        return [r for r in runs if r["kind"] == kind and r["project"] == project and r[key] == name]
+
+
+def _log_response(record: dict) -> PlainTextResponse:
+    """
+    The text of a run's log file
+    """
+
+    key = "pipeline" if record["kind"] == "pipelines" else "system"
+    path = _run_dir(record["kind"], record["project"], record[key], record["run"]) / "log"
+    if not path.is_file():
+        raise HTTPException(404, f"Run {record['run']} has no log file")
+    return PlainTextResponse(path.read_text(encoding="utf-8", errors="replace"))
+
+
+@app.get("/logs/pipelines")
+def list_pipeline_runs():
+    """
+    Pipeline runs and whether each is running, finished, or errored
+    """
+
+    with runs_lock:
+        return [_public_run(r) for r in runs if r["kind"] == "pipelines"]
+
+
+@app.get("/logs/systems")
+def list_system_runs():
+    """
+    System runs and whether each is running, finished, or errored
+    """
+
+    with runs_lock:
+        return [_public_run(r) for r in runs if r["kind"] == "systems"]
+
+
+@app.get("/logs/projects/{project}/pipelines/{pipeline}")
+def read_pipeline_log(project: str, pipeline: str):
+    """
+    The log of the latest run of a pipeline
+    """
+
+    matched = _matching_runs("pipelines", project, pipeline)
+    if not matched:
+        raise HTTPException(404, f"No runs of pipeline '{pipeline}' in project '{project}'")
+    return _log_response(max(matched, key=lambda record: record["run"]))
+
+
+@app.get("/logs/projects/{project}/pipelines/{pipeline}/{run}")
+def read_pipeline_run_log(project: str, pipeline: str, run: int):
+    """
+    The log of one pipeline run
+    """
+
+    matched = [r for r in _matching_runs("pipelines", project, pipeline) if r["run"] == run]
+    if not matched:
+        raise HTTPException(404, f"Run {run} of pipeline '{pipeline}' in project '{project}' not found")
+    return _log_response(matched[0])
+
+
+@app.get("/logs/projects/{project}/systems/{system}")
+def read_system_log(project: str, system: str):
+    """
+    The log of the latest run of a system
+    """
+
+    matched = _matching_runs("systems", project, system)
+    if not matched:
+        raise HTTPException(404, f"No runs of system '{system}' in project '{project}'")
+    return _log_response(max(matched, key=lambda record: record["run"]))
+
+
+@app.get("/logs/projects/{project}/systems/{system}/{run}")
+def read_system_run_log(project: str, system: str, run: int):
+    """
+    The log of one system run
+    """
+
+    matched = [r for r in _matching_runs("systems", project, system) if r["run"] == run]
+    if not matched:
+        raise HTTPException(404, f"Run {run} of system '{system}' in project '{project}' not found")
+    return _log_response(matched[0])
+
 
 # MAIN -------------------------------------------------------------------------
 
@@ -550,5 +774,8 @@ if __name__ == "__main__":
     # Leftovers of uploads and removals interrupted by a restart
     for leftover in PROJECTS_DIR.glob(".staging-*"):
         shutil.rmtree(leftover, ignore_errors=True)
+
+    # Build the run list from projects/.logs. It then lives until this process exits.
+    init_runs()
 
     uvicorn.run(app)
