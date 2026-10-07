@@ -12,6 +12,7 @@ import json
 import logging
 import os
 import shutil
+import signal
 import subprocess
 import sys
 import tarfile
@@ -34,7 +35,7 @@ LOGS_DIR = PROJECTS_DIR / ".logs"  # Hidden so it is not listed as a project
 
 log = logging.getLogger("valvestation")
 
-projects_lock = threading.Lock()  # Serialises adding and removing projects
+projects_lock = threading.Lock()  # Serialises project changes against each other and against starting a run
 runs_lock = threading.Lock()  # Serialises the run list
 runs: list[dict] = []  # Pipeline and system runs for this server process
 config: dict  # Filled by main() before the server accepts requests
@@ -186,7 +187,8 @@ def _project_name(project: Path) -> str:
 def add_project(file: UploadFile) -> dict:
     """
     Receive a Canonada project as a zip or tar archive. Its name is read from canonada.toml, and a
-    project with the same name is overwritten.
+    project with the same name is overwritten. Runs of the project that are still going are stopped
+    before the old files are removed.
     """
 
     staging = Path(tempfile.mkdtemp(prefix=".staging-", dir=PROJECTS_DIR))
@@ -208,6 +210,7 @@ def add_project(file: UploadFile) -> dict:
         # Delete target if exists move tree to target
         with projects_lock:
             if target.exists():
+                _stop_project_runs(name, "ValveStation stopped this run because the project was updated")
                 shutil.rmtree(target)
                 replaced = True
             shutil.move(tree, target)
@@ -220,7 +223,8 @@ def add_project(file: UploadFile) -> dict:
 @app.delete("/project/remove/{project}")
 def remove_project(project: str) -> dict:
     """
-    Remove a Canonada project from the station
+    Remove a Canonada project from the station. Runs of the project that are still going are
+    stopped before its files are removed.
     """
 
     # Hidden entries are uploads and removals in progress
@@ -230,6 +234,7 @@ def remove_project(project: str) -> dict:
 
     try:
         with projects_lock:
+            _stop_project_runs(project, "ValveStation stopped this run because the project was removed")
             shutil.rmtree(PROJECTS_DIR.joinpath(project))
     except FileNotFoundError:  # Removed by another request meanwhile
         raise HTTPException(404, f"Project '{project}' not found")
@@ -485,7 +490,8 @@ sys.stdout.write("\\n")
 # Catalog ----------------------------------------------------------------------
 def _inject_toml(project: str, file: UploadFile, filename: str) -> dict:
     """
-    Replace one of a project's config TOML files with an uploaded file
+    Replace one of a project's config TOML files with an uploaded file. Runs of the project that
+    are still going are stopped before the file is replaced.
     """
 
     # Hidden entries are uploads and removals in progress
@@ -509,6 +515,7 @@ def _inject_toml(project: str, file: UploadFile, filename: str) -> dict:
             listed = {p.name for p in PROJECTS_DIR.iterdir() if p.is_dir() and not p.name.startswith(".")}
             if project not in listed:
                 raise HTTPException(404, f"Project '{project}' not found")
+            _stop_project_runs(project, "ValveStation stopped this run because the project was updated")
             target.parent.mkdir(exist_ok=True)
             replaced = target.is_file()
             shutil.move(uploaded, target)
@@ -654,13 +661,21 @@ def init_runs() -> None:
 
 def _watch_run(record: dict, proc: subprocess.Popen[bytes], log_file: IO[str]) -> None:
     """
-    Wait for a run to exit and record whether it finished or errored
+    Wait for a run to exit and record whether it finished or errored. A run stopped because
+    its project changed is recorded as errored, and the reason is appended to its log.
     """
 
     try:
-        status = "finished" if proc.wait() == 0 else "errored"
-    except Exception:
-        status = "errored"
+        try:
+            status = "finished" if proc.wait() == 0 else "errored"
+        except Exception:
+            status = "errored"
+        reason = record.get("stop_reason")
+        if isinstance(reason, str):
+            status = "errored"
+            # The run inherited this file. Seek so the reason follows what it wrote.
+            log_file.seek(0, os.SEEK_END)
+            log_file.write(reason + "\n")
     finally:
         log_file.close()
     with runs_lock:
@@ -670,37 +685,91 @@ def _watch_run(record: dict, proc: subprocess.Popen[bytes], log_file: IO[str]) -
     status_path.write_text(status + "\n", encoding="utf-8")
 
 
+def _terminate_run(proc: subprocess.Popen[bytes]) -> None:
+    """
+    Stop a run and the workers it spawned. The run was started in its own session, so the
+    signal reaches that session only. SIGTERM is tried first; SIGKILL follows if it is still
+    alive after a few seconds.
+    """
+
+    if proc.poll() is not None:
+        return
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        proc.wait()
+        return
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        proc.wait()
+
+
+def _stop_project_runs(project: str, reason: str) -> None:
+    """
+    Stop every run of a project that is still going, and wait until those processes have
+    exited. The caller holds projects_lock, so no new run of any project can start until
+    the project change that required the stop has finished.
+    """
+
+    with runs_lock:
+        active = []
+        for record in runs:
+            proc = record.get("proc")
+            if record["project"] != project or record["status"] != "running" or not isinstance(proc, subprocess.Popen):
+                continue
+            if proc.poll() is not None:
+                continue
+            record["stop_reason"] = reason
+            active.append(record)
+    for record in active:
+        _terminate_run(record["proc"])
+        watcher = record.get("watcher")
+        if isinstance(watcher, threading.Thread):
+            watcher.join(timeout=5)
+
+
 def _start_run(kind: str, project: str, name: str) -> dict:
     """
     Start a Canonada pipeline or system. stdout and stderr share one log file, and each
-    start gets the next run number for that name.
+    start gets the next run number for that name. The process runs in its own session so
+    it can be stopped, together with the workers it spawns, without signalling the server.
     """
 
     key = "pipeline" if kind == "pipelines" else "system"
-    with runs_lock:
-        taken = [r["run"] for r in runs if r["kind"] == kind and r["project"] == project and r[key] == name]
-        run = max(taken, default=0) + 1
-        run_dir = _run_dir(kind, project, name, run)
-        run_dir.mkdir(parents=True)
-        (run_dir / "status").write_text("running\n", encoding="utf-8")
-        log_file = (run_dir / "log").open("w", encoding="utf-8")
-        record = {"kind": kind, "project": project, key: name, "run": run, "status": "running"}
-        runs.append(record)
-        try:
-            proc = subprocess.Popen(
-                [sys.executable, "-P", "-m", "canonada.cli", "run", kind, name],
-                cwd=PROJECTS_DIR / project,
-                stdin=subprocess.DEVNULL,
-                stdout=log_file,
-                stderr=subprocess.STDOUT,
-                env={**os.environ, "PYTHONUNBUFFERED": "1"},
-            )
-        except OSError as e:
-            log_file.close()
-            record["status"] = "errored"
-            (run_dir / "status").write_text("errored\n", encoding="utf-8")
-            raise HTTPException(500, f"Could not start Canonada: {e}")
-    threading.Thread(target=_watch_run, args=(record, proc, log_file), daemon=True).start()
+    with projects_lock:
+        with runs_lock:
+            taken = [r["run"] for r in runs if r["kind"] == kind and r["project"] == project and r[key] == name]
+            run = max(taken, default=0) + 1
+            run_dir = _run_dir(kind, project, name, run)
+            run_dir.mkdir(parents=True)
+            (run_dir / "status").write_text("running\n", encoding="utf-8")
+            log_file = (run_dir / "log").open("w", encoding="utf-8")
+            record = {"kind": kind, "project": project, key: name, "run": run, "status": "running"}
+            runs.append(record)
+            try:
+                proc = subprocess.Popen(
+                    [sys.executable, "-P", "-m", "canonada.cli", "run", kind, name],
+                    cwd=PROJECTS_DIR / project,
+                    stdin=subprocess.DEVNULL,
+                    stdout=log_file,
+                    stderr=subprocess.STDOUT,
+                    env={**os.environ, "PYTHONUNBUFFERED": "1"},
+                    start_new_session=True,
+                )
+            except OSError as e:
+                log_file.close()
+                record["status"] = "errored"
+                (run_dir / "status").write_text("errored\n", encoding="utf-8")
+                raise HTTPException(500, f"Could not start Canonada: {e}")
+            record["proc"] = proc
+            watcher = threading.Thread(target=_watch_run, args=(record, proc, log_file), daemon=True)
+            record["watcher"] = watcher
+            watcher.start()
     return _public_run(record)
 
 
