@@ -7,6 +7,7 @@ Run with:
     valvestation
 """
 
+import hashlib
 import hmac
 import json
 import logging
@@ -240,6 +241,55 @@ def remove_project(project: str) -> dict:
         raise HTTPException(404, f"Project '{project}' not found")
 
     return {"project": project, "removed": True}
+
+
+def _project_fingerprint(directory: Path) -> tuple[str, str]:
+    """
+    The version from canonada.toml and a sha256 of the project files. Paths are relative,
+    sorted, and use '/'. Directories named .git or __pycache__ are skipped.
+    """
+
+    with (directory / "canonada.toml").open("rb") as handle:
+        data = tomllib.load(handle)
+    project = data.get("project") if isinstance(data, dict) else None
+    version = project.get("version") if isinstance(project, dict) else None
+    if not isinstance(version, str):
+        version = ""
+    digest = hashlib.sha256()
+    files = []
+    for path in directory.rglob("*"):
+        if not path.is_file():
+            continue
+        relative = path.relative_to(directory)
+        if ".git" in relative.parts or "__pycache__" in relative.parts:
+            continue
+        files.append((relative.as_posix(), path))
+    for relative, path in sorted(files):
+        payload = path.read_bytes()
+        digest.update(relative.encode())
+        digest.update(b"\0")
+        digest.update(str(len(payload)).encode())
+        digest.update(b"\0")
+        digest.update(payload)
+    return version, digest.hexdigest()
+
+
+@app.get("/project/version/{project}")
+def project_version(project: str) -> dict:
+    """
+    Returns the project's version from canonada.toml and a sha256 of its files
+    """
+
+    if not project or project != Path(project).name or project.startswith("."):
+        raise HTTPException(404, f"Project '{project}' not found")
+    directory = PROJECTS_DIR / project
+    if not directory.is_dir():
+        raise HTTPException(404, f"Project '{project}' not found")
+    try:
+        version, digest = _project_fingerprint(directory)
+    except (OSError, tomllib.TOMLDecodeError) as e:
+        raise HTTPException(400, f"Could not read the project version: {e}")
+    return {"project": project, "version": version, "sha256": digest}
 
 
 # Registry ---------------------------------------------------------------------

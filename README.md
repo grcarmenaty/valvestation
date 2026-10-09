@@ -68,6 +68,7 @@ To get an API response the client will need to send a pre-shared token, that wil
 
 ### Project
 - PUT <prefix>/add: Receive a Canonada project and index its catalog files and pipelines. -> If the project name is the same the project gets ovewritten
+- GET <prefix>/version/{project}: Returns the project's version from canonada.toml and a sha256 of its files
 - DELETE <prefix>/remove/{project}: Remove a Canonada project from the station. (By project name)
 
 ### Misc
