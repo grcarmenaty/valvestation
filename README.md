@@ -59,6 +59,8 @@ To get an API response the client will need to send a pre-shared token, that wil
 ### Run
 - POST <prefix>/pipeline: Run a pipeline and save its full output into a log file -> API keeps track of the running process state (internal list)
 - POST <prefix>/system: Run a system and save its full output into a log file -> API keeps track of the running process state
+- DELETE <prefix>/pipeline/{project}/{pipeline}/{run}: Stop that pipeline run. A missing run is 404. A run that is not running is 409.
+- DELETE <prefix>/system/{project}/{system}/{run}: Stop that system run. A missing run is 404. A run that is not running is 409.
 
 ### Logs
 - GET <prefix>/pipelines: Read/List pipeline execution status (running/errored/finished)

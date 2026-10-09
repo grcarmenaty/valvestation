@@ -847,6 +847,52 @@ def run_system(project: str, system: str) -> dict:
     return _start_run("systems", project, system)
 
 
+def _stop_run(kind: str, project: str, name: str, run: int) -> dict:
+    """
+    Stop one pipeline or system run that is still going. The watcher records it as errored.
+    """
+
+    key = "pipeline" if kind == "pipelines" else "system"
+    with runs_lock:
+        matched = [
+            record
+            for record in runs
+            if record["kind"] == kind and record["project"] == project and record[key] == name and record["run"] == run
+        ]
+        if not matched:
+            raise HTTPException(404, f"Run {run} of {key} '{name}' in project '{project}' not found")
+        record = matched[0]
+        if record["status"] != "running":
+            raise HTTPException(409, f"Run {run} of {key} '{name}' in project '{project}' is not running")
+        proc = record.get("proc")
+        if not isinstance(proc, subprocess.Popen) or proc.poll() is not None:
+            raise HTTPException(409, f"Run {run} of {key} '{name}' in project '{project}' is not running")
+        record["stop_reason"] = "ValveStation stopped this run"
+    _terminate_run(record["proc"])
+    watcher = record.get("watcher")
+    if isinstance(watcher, threading.Thread):
+        watcher.join(timeout=5)
+    return _public_run(record)
+
+
+@app.delete("/run/pipeline/{project}/{pipeline}/{run}")
+def stop_pipeline(project: str, pipeline: str, run: int) -> dict:
+    """
+    Stop one pipeline run that is still going
+    """
+
+    return _stop_run("pipelines", project, pipeline, run)
+
+
+@app.delete("/run/system/{project}/{system}/{run}")
+def stop_system(project: str, system: str, run: int) -> dict:
+    """
+    Stop one system run that is still going
+    """
+
+    return _stop_run("systems", project, system, run)
+
+
 # Logs -------------------------------------------------------------------------
 def _matching_runs(kind: str, project: str, name: str) -> list[dict]:
     """
